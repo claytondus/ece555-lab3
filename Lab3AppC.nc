@@ -2,9 +2,10 @@ configuration Lab3AppC { }
 implementation
 {
   components Lab3C, MainC, ActiveMessageC, LedsC,
-    new TimerMilliC(), 
-    SerialActiveMessageC as Serial,
-    new AMSenderC(AM_LAB3), new AMReceiverC(AM_LAB3);
+    new TimerMilliC(), new TimerMilliC() as SerialTimerC,
+    new AMSenderC(AM_LAB3), new AMReceiverC(AM_LAB3),
+    SerialActiveMessageC,
+    new SerialAMSenderC(AM_OSCILLOSCOPE), new SerialAMReceiverC(AM_OSCILLOSCOPE);
 
   Lab3C.Boot -> MainC;
   Lab3C.RadioControl -> ActiveMessageC;
@@ -14,11 +15,10 @@ implementation
   Lab3C.Leds -> LedsC;
  
   
-  Lab3C.SerialControl -> Serial;
-  Lab3C.UartSend -> Serial;
-  Lab3C.UartReceive -> Serial.Receive;
-  Lab3C.UartPacket -> Serial;
-  Lab3C.UartAMPacket -> Serial;
+  Lab3C.SerialControl -> SerialActiveMessageC;
+  Lab3C.SerialAMSend -> SerialAMSenderC;
+  Lab3C.SerialReceive -> SerialAMReceiverC;
+  Lab3C.SerialTimer -> SerialTimerC;
   
 
   

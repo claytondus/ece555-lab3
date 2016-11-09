@@ -1,6 +1,8 @@
 #include "Timer.h"
 #include "Lab3.h"
 //#include "printf.h"
+#include "AM.h"
+#include "Serial.h"
 
 module Lab3C @safe()
 {
@@ -13,14 +15,14 @@ module Lab3C @safe()
     interface Leds;
     
     interface SplitControl as SerialControl;
-    interface AMSend as UartSend[am_id_t id];
-    interface Receive as UartReceive[am_id_t id];
-    interface Packet as UartPacket;
-    interface AMPacket as UartAMPacket;
+    interface AMSend as SerialAMSend;
+    interface Receive as SerialReceive;
+    interface Timer<TMilli> as SerialTimer;
   }
 }
 implementation
 {
+   
   message_t sendBuf;
   bool sendBusy;
 
@@ -30,9 +32,31 @@ implementation
   uint8_t first_bid = 0;
   uint8_t first_source = 0;
   uint8_t random0to5 = 0;
+  uint16_t motebid[3];
+
+  
+  //Serial vars
+  message_t serialSendBuf;
+  bool serialSendBusy;
+
+  /* Current local state - interval, version and accumulated readings */
+  oscilloscope_t serialLocal[3];
+
+  uint8_t reading; /* 0 to NREADINGS */
+
+  /* When we head an Oscilloscope message, we check it's sample count. If
+     it's ahead of ours, we "jump" forwards (set our count to the received
+     count). However, we must then suppress our next count increment. This
+     is a very simple form of "time" synchronization (for an abstract
+     notion of time). */
+  bool suppressCountChange;
+  
+  int serialPacketsRemaining = 0;
   
 
   event void Boot.booted() {
+  	int i = 0;
+  	
     local.generation = 0;
     local.source = TOS_NODE_ID;
     local.type = BID;
@@ -43,16 +67,26 @@ implementation
     srand(TOS_NODE_ID);
    
 	sendBusy = FALSE;
+	
+	memset(motebid, 0, sizeof(motebid));
+	
+
+    for(i = 0; i <= 2; i++) {
+		serialLocal[i].interval = SERIAL_INTERVAL;
+		serialLocal[i].id = i + 1;
+	}
  
     call Leds.set(0);
     call RadioControl.start();
+    call SerialControl.start();
+
   }
 
   void startTimer() {
 	//printf("Starting timer\n");
 	//printfflush();
     call Leds.set(local.bid);
-    call Timer.startOneShot(DEFAULT_INTERVAL);
+    call Timer.startOneShot(LED_INTERVAL);
   }
   
   void sendLocal() {
@@ -77,12 +111,28 @@ implementation
 
   event void RadioControl.stopDone(error_t error) {
   }
+  
+  
+  void serialStartTimer() {
+    call SerialTimer.startPeriodic(serialLocal[0].interval);
+    reading = 0;
+  }
 
+  event void SerialControl.startDone(error_t error) {
+    serialStartTimer();
+  }
+
+  event void SerialControl.stopDone(error_t error) {
+  }
+  
+ 
   event message_t* Receive.receive(message_t* msg, void* payload, uint8_t len) {
     lab3_t *l3msg = payload;
     
     //printf("RX: Source: %d  Bid: %d  Type: %d   Generation: %d   Winner: %d\n", l3msg->source, l3msg->bid, l3msg->type, l3msg->generation, l3msg->winner);
 	//printfflush();
+	
+	motebid[l3msg->source - 1] = l3msg->bid;
     
 	if(master == TOS_NODE_ID) {
 		
@@ -105,6 +155,7 @@ implementation
 			//First bid
 			first_bid = l3msg->bid;
 			first_source = l3msg->source;
+			motebid[l3msg->source - 1] = l3msg->bid;
 			
 			//printf("Bid rx: 1st bid, %d, from %d\n", first_bid, first_source);
 			//printfflush();
@@ -116,6 +167,7 @@ implementation
 			
 				//printf("Bid rx: 2nd bid, %d, from %d\n", l3msg->bid, l3msg->source);
 				//printfflush();
+				motebid[l3msg->source - 1] = l3msg->bid;
 				
 				//Switch to AWARD phase
 				local.type = AWARD;
@@ -143,7 +195,7 @@ implementation
 		//Slave
 		//printf("Rx packet as slave\n");
 		//printfflush();
-		
+
 		//Ignore messages not from master
 		if(l3msg->source != master) {
 			//printf("Ignored message not from master\n");
@@ -166,6 +218,7 @@ implementation
 			local.bid = 1 + (random0to5 % 6); //random between 1 and 6 inclusive
 			//printf("Bidding %d from mote %d\n", local.bid, TOS_NODE_ID);
 			//printfflush();
+			motebid[TOS_NODE_ID - 1] = local.bid;
 			startTimer();
 				
 		} else {  //AWARD
@@ -184,6 +237,7 @@ implementation
 			    //printfflush();
 				master = TOS_NODE_ID;
 				local.bid = 7;
+				motebid[TOS_NODE_ID - 1] = 7;
 				startTimer();
 				
 			} else {
@@ -193,6 +247,7 @@ implementation
 			    //printfflush();
 				master = l3msg->winner;
 				local.bid = 0;
+				motebid[TOS_NODE_ID - 1] = 0;
 				
 			}
 		
@@ -226,6 +281,7 @@ implementation
 			local.generation++;
 			local.type = BID;
 			local.bid = 0;
+			motebid[TOS_NODE_ID - 1] = 0;
 		}
 
 	} else {
@@ -248,5 +304,83 @@ implementation
 	//printfflush();
   }
 
+
+  task void serialSendTask() {
+    serialPacketsRemaining--;
+	if (!serialSendBusy)
+	  {
+		memcpy(call SerialAMSend.getPayload(&serialSendBuf, sizeof(oscilloscope_t)), &(serialLocal[serialPacketsRemaining]), sizeof(oscilloscope_t));
+		if (call SerialAMSend.send(AM_BROADCAST_ADDR, &serialSendBuf, sizeof(oscilloscope_t)) == SUCCESS) {
+		  serialSendBusy = TRUE;
+		}
+		
+	  }
+  }
+
+  event message_t* SerialReceive.receive(message_t* msg, void* payload, uint8_t len) {
+    oscilloscope_t *omsg = payload;
+    int i = 0;
+
+    /* If we receive a newer version, update our interval. 
+       If we hear from a future count, jump ahead but suppress our own change
+    */
+    if (omsg->version > serialLocal[0].version)
+      {
+		for(i = 0; i <= 2 ; i++) {
+			serialLocal[i].version = omsg->version;
+			serialLocal[i].interval = omsg->interval;
+		}
+		serialStartTimer();
+      }
+    if (omsg->count > serialLocal[0].count)
+      {
+		for(i = 0; i <= 2; i++) {
+			serialLocal[i].count = omsg->count;
+		}
+		suppressCountChange = TRUE;
+      }
+
+    return msg;
+  }
+
+  /* At each sample period:
+     - if local sample buffer is full, send accumulated samples
+     - read next sample
+  */
+  event void SerialTimer.fired() {
+	int i = 0;
+	
+    if (reading == NREADINGS) {
+	  if (!serialSendBusy) {
+	    serialPacketsRemaining = 3;
+		post serialSendTask();
+
+		reading = 0;
+		/* Part 2 of cheap "time sync": increment our count if we didn't
+		   jump ahead. */
+		if (!suppressCountChange) {
+			for(i = 0; i <= 2; i++) {
+				serialLocal[i].count++;
+			}
+		}
+		suppressCountChange = FALSE;
+      }
+    }
+
+	//Update readings
+	if (reading < NREADINGS) {
+      reading++;
+      for(i = 0; i <= 2; i++) {
+		serialLocal[i].readings[reading] = motebid[i];
+	  }
+    }
+  }
+
+  event void SerialAMSend.sendDone(message_t* msg, error_t error) {
+    serialSendBusy = FALSE;
+    if(serialPacketsRemaining) {
+		post serialSendTask();
+	}
+  }
 
 }
